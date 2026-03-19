@@ -1,0 +1,1 @@
+# SG_vs_HK_Quant_Trading_Hackathon_2026
