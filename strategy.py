@@ -35,9 +35,9 @@ def check_stop_loss(client):
     if drop_percentage >= STOP_LOSS_THRESHOLD:
         print(f"STOP LOSS ALERT! {pair} dropped {drop_percentage*100:.2f}%. Current Price: {current_price}")
         
-        # 1. Fetch exact balance to know how much to sell
+        # 1. Fetch exact balance to know how much to sell (FIXED SpotWallet)
         balance_data = client.get_balance()
-        held_amount = balance_data["Wallet"][STATE["held_coin"]]["Free"]
+        held_amount = balance_data["SpotWallet"][STATE["held_coin"]]["Free"]
         
         # 2. Execute Market Sell to get out immediately
         client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
@@ -98,7 +98,8 @@ def run_rebalance(client):
     if STATE["held_coin"] is not None:
         coin = STATE["held_coin"]
         pair = f"{coin}/USD"
-        held_amount = balance_data["Wallet"][coin]["Free"]
+        # FIXED SpotWallet
+        held_amount = balance_data["SpotWallet"][coin]["Free"]
         
         # Only sell if we have a meaningful amount (ignoring dust)
         if held_amount > 0.001: 
@@ -150,15 +151,16 @@ def run_rebalance(client):
     # ==========================================
     # STEP 4: Execute the Buy
     # ==========================================
-    current_usd = balance_data["Wallet"]["USD"]["Free"]
+    # FIXED SpotWallet
+    current_usd = balance_data["SpotWallet"]["USD"]["Free"]
     buy_price = market_data[best_pair]["LastPrice"]
     
     # Calculate how much we can buy (98% of USD)
     usable_usd = current_usd * 0.98 
     quantity_to_buy = usable_usd / buy_price
     
-    # Round down to 4 decimal places to avoid API precision errors
-    quantity_to_buy = math.floor(quantity_to_buy * 10000) / 10000.0
+    # THE FIX: Round down to 2 decimal places to avoid step-size errors
+    quantity_to_buy = math.floor(quantity_to_buy * 100) / 100.0
 
     print(f"Winner selected: {best_pair} (24h Change: {highest_change*100:.2f}%).")
     print(f"Buying {quantity_to_buy} at {buy_price} per unit...")

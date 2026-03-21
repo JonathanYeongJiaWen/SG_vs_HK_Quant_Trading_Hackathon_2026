@@ -13,9 +13,10 @@ class RoostooClient:
     def _generate_signature(self, params: dict) -> tuple:
         """
         Generates HMAC SHA256 signature.
-        Roostoo requires params to be formatted as a query string.
+        Roostoo requires params to be sorted alphabetically and formatted as a query string.
         """
-        query_string = urlencode(params)
+        # THE FIX: Sorts parameters alphabetically and protects the forward slash
+        query_string = urlencode(dict(sorted(params.items())), safe='/')
         signature = hmac.new(
             self.secret_key.encode('utf-8'),
             query_string.encode('utf-8'),
@@ -26,7 +27,7 @@ class RoostooClient:
     def _request(self, method: str, endpoint: str, params: dict = None, require_auth: bool = False):
         """
         Centralized request handler. Manages headers, signatures, and exception handling 
-        so the bot doesn't crash on 502 Bad Gateway or timeout errors.
+        so the bot doesn't crash on errors.
         """
         url = f"{self.base_url}{endpoint}"
         params = params or {}
@@ -67,7 +68,6 @@ class RoostooClient:
     def get_ticker(self, pair: str = None):
         """GET /v3/ticker - RCL_TSCheck level"""
         params = {'pair': pair} if pair else {}
-        # RCL_TSCheck level requires a timestamp, but not necessarily a full signature
         params['timestamp'] = int(time.time() * 1000)
         return self._request('GET', '/v3/ticker', params=params)
 
