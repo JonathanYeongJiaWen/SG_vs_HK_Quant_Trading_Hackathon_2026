@@ -1,7 +1,7 @@
 import math
+import requests
 
 # A simple in-memory state tracker so the bot remembers what it bought
-# In a full enterprise system, you'd save this to a database, but for a 10-day hackathon, memory is fine.
 STATE = {
     "held_coin": None,
     "buy_price": 0.0
@@ -49,6 +49,34 @@ def check_stop_loss(client):
         
     return False
 
+def get_real_world_regime():
+    """
+    Fetches real-world BTC data from Binance's public API.
+    Calculates a simple 20-period Moving Average on 4-hour candles.
+    Returns True if Bullish (Safe to trade), False if Bearish (Go to USD).
+    """
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        # Fetch the last 20 candles, each representing 4 hours of real trading
+        params = {"symbol": "BTCUSDT", "interval": "4h", "limit": 20}
+        response = requests.get(url, params=params, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        
+        # In Binance data, the closing price is at index 4
+        closes = [float(candle[4]) for candle in data]
+        current_price = closes[-1]
+        moving_average = sum(closes) / len(closes)
+        
+        if current_price > moving_average:
+            return True # Bullish
+        else:
+            return False # Bearish
+            
+    except Exception as e:
+        print(f"External Data Error: {e}. Defaulting to safe mode (Bearish).")
+        return False
+
 def run_rebalance(client):
     """
     The Slow Loop (Offense): Sells current holdings, evaluates the macro regime, 
@@ -84,13 +112,13 @@ def run_rebalance(client):
         balance_data = client.get_balance()
 
     # ==========================================
-    # STEP 2: The Macro Regime Filter
+    # STEP 2: The Macro Regime Filter (BINANCE UPGRADE)
     # ==========================================
-    market_data = ticker_data["Data"]
-    btc_change = market_data.get("BTC/USD", {}).get("Change", 0)
+    print("Checking real-world market regime via Binance...")
+    is_bullish = get_real_world_regime()
     
-    if btc_change < 0:
-        print(f"Macro Regime is BEARISH (BTC 24h Change: {btc_change*100:.2f}%).")
+    if not is_bullish:
+        print("Macro Regime is BEARISH based on real-world Binance data.")
         print("Staying safely in USD. Will check again in 4 hours.")
         return # Abort buying. We successfully protected the portfolio.
 
@@ -99,6 +127,7 @@ def run_rebalance(client):
     # ==========================================
     print("Macro Regime is BULLISH. Scanning for top momentum asset...")
     
+    market_data = ticker_data["Data"]
     best_pair = None
     highest_change = -999.0
     
@@ -124,8 +153,7 @@ def run_rebalance(client):
     current_usd = balance_data["Wallet"]["USD"]["Free"]
     buy_price = market_data[best_pair]["LastPrice"]
     
-    # Calculate how much we can buy. 
-    # We use 98% of our USD to leave room for the 0.1% Taker Fee and avoid "Insufficient Funds" errors.
+    # Calculate how much we can buy (98% of USD)
     usable_usd = current_usd * 0.98 
     quantity_to_buy = usable_usd / buy_price
     
@@ -138,7 +166,6 @@ def run_rebalance(client):
     order_response = client.place_order(pair=best_pair, side="BUY", order_type="MARKET", quantity=quantity_to_buy)
     
     if order_response and order_response.get("Success"):
-        # Update our internal state so the Fast Loop can start protecting it
         coin_name = best_pair.split('/')[0]
         STATE["held_coin"] = coin_name
         STATE["buy_price"] = buy_price
