@@ -1,18 +1,16 @@
 import math
 import requests
+import datetime
 
-# Upgraded to a dictionary to hold multiple assets at once
 STATE = {
-    "held_coins": {} # Format: {"ZEN": 5.833, "BTC": 60000.0}
+    "held_coins": {},
+    "last_trade_date": None 
 }
 
 STOP_LOSS_THRESHOLD = 0.03 
 
 def check_stop_loss(client):
-    """
-    The Fast Loop (Defense): Checks all currently held assets.
-    Sells individual coins if they drop 3% below their specific entry price.
-    """
+    """The Fast Loop (Defense): Checks all currently held assets."""
     global STATE
     if not STATE["held_coins"]: return False
         
@@ -38,17 +36,17 @@ def check_stop_loss(client):
             coins_to_remove.append(coin)
             triggered = True
             
-    # Clean up the state dictionary
     for coin in coins_to_remove:
         del STATE["held_coins"][coin]
         
     return triggered
 
 def get_real_world_regime():
-    """Fetches real-world BTC data from Binance's public API."""
+    """Fetches real-world BTC data from Binance (48-Hour Macro Filter)."""
     try:
         url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": "BTCUSDT", "interval": "4h", "limit": 20}
+        # Adjusted to 12 periods of 4H candles = 48 hours
+        params = {"symbol": "BTCUSDT", "interval": "4h", "limit": 12} 
         response = requests.get(url, params=params, timeout=5)
         response.raise_for_status()
         data = response.json()
@@ -59,14 +57,11 @@ def get_real_world_regime():
         
         return current_price > moving_average
     except Exception as e:
-        print(f"External Data Error: {e}. Defaulting to safe mode (Bearish).")
+        print(f"External Data Error: {e}. Defaulting to safe mode.")
         return False
 
 def run_rebalance(client):
-    """
-    The Slow Loop (Offense): Maintains a diversified Top-5 Momentum portfolio 
-    to optimize Sharpe/Sortino ratios.
-    """
+    """The Slow Loop (Offense): Top-5 Momentum & Activity Logging."""
     global STATE
     
     print("Fetching market data for rebalance...")
@@ -74,24 +69,47 @@ def run_rebalance(client):
     balance_data = client.get_balance()
     
     if not ticker_data or not balance_data:
-        print("API Error: Failed to fetch data. Aborting rebalance.")
+        print("API Error: Failed to fetch data.")
         return
 
     market_data = ticker_data["Data"]
+    
+    # Grab current UTC time to sync with the 8:00 PM HKT reset (12:00 PM UTC)
+    current_utc_time = datetime.datetime.utcnow()
+    current_utc_date = current_utc_time.date()
 
     # ==========================================
-    # STEP 1: The Macro Regime Filter
+    # STEP 1: The Macro Regime Filter & Ping Trade
     # ==========================================
     is_bullish = get_real_world_regime()
     
     if not is_bullish:
-        print("Macro Regime is BEARISH. Liquidating all positions to USD.")
+        print("Macro Regime is BEARISH. Checking for needed liquidations...")
+        traded_today = False
+        
         for coin in list(STATE["held_coins"].keys()):
             pair = f"{coin}/USD"
             held_amount = balance_data["SpotWallet"][coin]["Free"]
             if held_amount > 0.001:
                 client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                traded_today = True
+                
         STATE["held_coins"].clear()
+        
+        if traded_today:
+            STATE["last_trade_date"] = current_utc_date
+            
+        # The Ping Trade: Triggers only if no trades happened today, 
+        # and only between 11:00 AM and 11:59 AM UTC (7:00 PM - 7:59 PM HKT)
+        if STATE["last_trade_date"] != current_utc_date:
+            if current_utc_time.hour == 11: 
+                print("Approaching daily cutoff. Executing minimal ping trade...")
+                client.place_order(pair="ZEN/USD", side="BUY", order_type="MARKET", quantity=10.0)
+                client.place_order(pair="ZEN/USD", side="SELL", order_type="MARKET", quantity=10.0)
+                STATE["last_trade_date"] = current_utc_date
+                print("Ping trade complete. Daily activity logged.")
+            else:
+                print(f"Standing by safely in cash. Will check ping logic closer to cutoff.")
         return
 
     # ==========================================
@@ -105,42 +123,41 @@ def run_rebalance(client):
         if pair not in exclude_list and info.get("Change", 0) > 0:
             valid_pairs.append((pair, info.get("Change", 0)))
             
-    # Sort by highest momentum descending and grab the top 5
     valid_pairs.sort(key=lambda x: x[1], reverse=True)
     top_5_pairs = [x[0] for x in valid_pairs[:5]]
     top_5_coins = [p.split('/')[0] for p in top_5_pairs]
 
     if not top_5_pairs:
-        print("No assets have positive momentum today. Staying in USD.")
+        print("No positive momentum assets today. Staying in USD.")
         return
 
     # ==========================================
-    # STEP 3: Liquidate Losers (Anti-Churn Logic)
+    # STEP 3: Liquidate Losers (Anti-Churn)
     # ==========================================
+    traded_today = False
     for coin in list(STATE["held_coins"].keys()):
         if coin not in top_5_coins:
             pair = f"{coin}/USD"
             held_amount = balance_data["SpotWallet"][coin]["Free"]
-            print(f"{coin} fell out of the Top 5. Liquidating to free up cash...")
+            print(f"{coin} fell out of the Top 5. Liquidating...")
             if held_amount > 0.001:
                 client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                traded_today = True
             del STATE["held_coins"][coin]
             
-    # Refresh balance data so we know exactly how much cash we freed up
     balance_data = client.get_balance()
     current_usd = balance_data["SpotWallet"]["USD"]["Free"]
 
     # ==========================================
     # STEP 4: Buy the New Winners
     # ==========================================
-    # Find which of the top 5 we don't already own
     coins_to_buy = [coin for coin in top_5_coins if coin not in STATE["held_coins"]]
     
     if not coins_to_buy:
-        print("Already holding the optimal Top 5 portfolio. No action needed.")
+        print("Holding the optimal portfolio. No action needed.")
+        if traded_today: STATE["last_trade_date"] = current_utc_date
         return
         
-    # Divide available cash evenly among the new coins we need to buy
     usd_per_coin = (current_usd * 0.98) / len(coins_to_buy)
     
     for coin in coins_to_buy:
@@ -153,3 +170,7 @@ def run_rebalance(client):
         
         if order_response and order_response.get("Success"):
             STATE["held_coins"][coin] = buy_price
+            traded_today = True
+            
+    if traded_today:
+        STATE["last_trade_date"] = current_utc_date
