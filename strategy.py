@@ -163,7 +163,7 @@ def run_rebalance(client):
                 price = market_data[pair]["LastPrice"]
                 
                 # Round quantity to handle precision errors on meme coins
-                qty = round((usd_per_coin / price), 4) 
+                qty = format_qty(usd_per_coin, price)
                 
                 print(f"Attempting to buy {qty} of {coin}...")
                 order_response = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
