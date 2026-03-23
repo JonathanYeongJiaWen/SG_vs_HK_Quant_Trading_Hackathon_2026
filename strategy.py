@@ -1,176 +1,139 @@
 import math
 import requests
 import datetime
+import json
+import os
 
-STATE = {
-    "held_coins": {},
-    "last_trade_date": None 
-}
+# --- PERSISTENCE LOGIC ---
+STATE_FILE = "state.json"
 
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r") as f:
+                state = json.load(f)
+                # Convert string date back to date object
+                if state.get("last_trade_date"):
+                    state["last_trade_date"] = datetime.datetime.strptime(state["last_trade_date"], "%Y-%m-%d").date()
+                return state
+        except Exception as e:
+            print(f"Error loading state: {e}")
+    return {"held_coins": {}, "last_trade_date": None}
+
+def save_state(state):
+    state_copy = state.copy()
+    if state_copy.get("last_trade_date"):
+        # Convert date object to string for JSON
+        if isinstance(state_copy["last_trade_date"], datetime.date):
+            state_copy["last_trade_date"] = state_copy["last_trade_date"].strftime("%Y-%m-%d")
+    with open(STATE_FILE, "w") as f:
+        json.dump(state_copy, f)
+
+STATE = load_state()
 STOP_LOSS_THRESHOLD = 0.03 
 
-def check_stop_loss(client):
-    """The Fast Loop (Defense): Checks all currently held assets."""
-    global STATE
-    if not STATE["held_coins"]: return False
-        
-    ticker_data = client.get_ticker()
-    balance_data = client.get_balance()
-    if not ticker_data or not balance_data: return False
-        
-    market_data = ticker_data["Data"]
-    coins_to_remove = []
-    triggered = False
-    
-    for coin, buy_price in STATE["held_coins"].items():
-        pair = f"{coin}/USD"
-        if pair not in market_data: continue
-        
-        current_price = market_data[pair]["LastPrice"]
-        drop_percentage = (buy_price - current_price) / buy_price
-        
-        if drop_percentage >= STOP_LOSS_THRESHOLD:
-            print(f"STOP LOSS ALERT! {pair} dropped {drop_percentage*100:.2f}%.")
-            held_amount = balance_data["SpotWallet"][coin]["Free"]
-            client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-            coins_to_remove.append(coin)
-            triggered = True
-            
-    for coin in coins_to_remove:
-        del STATE["held_coins"][coin]
-        
-    return triggered
-
 def get_real_world_regime():
-    """Fetches real-world BTC data from Binance (48-Hour Macro Filter)."""
+    """24-Hour Moving Average Filter (6 candles * 4 hours)"""
     try:
         url = "https://api.binance.com/api/v3/klines"
-        # Adjusted to 12 periods of 4H candles = 48 hours
-        params = {"symbol": "BTCUSDT", "interval": "4h", "limit": 12} 
+        params = {"symbol": "BTCUSDT", "interval": "4h", "limit": 6} 
         response = requests.get(url, params=params, timeout=5)
         response.raise_for_status()
         data = response.json()
-        
         closes = [float(candle[4]) for candle in data]
         current_price = closes[-1]
-        moving_average = sum(closes) / len(closes)
-        
-        return current_price > moving_average
+        moving_avg = sum(closes) / len(closes)
+        return current_price > moving_avg
     except Exception as e:
-        print(f"External Data Error: {e}. Defaulting to safe mode.")
+        print(f"Binance API Error: {e}")
         return False
 
 def run_rebalance(client):
-    """The Slow Loop (Offense): Top-5 Momentum & Activity Logging."""
     global STATE
-    
-    print("Fetching market data for rebalance...")
     ticker_data = client.get_ticker()
     balance_data = client.get_balance()
-    
-    if not ticker_data or not balance_data:
-        print("API Error: Failed to fetch data.")
-        return
+    if not ticker_data or not balance_data: return
 
     market_data = ticker_data["Data"]
-    
-    # Grab current UTC time to sync with the 8:00 PM HKT reset (12:00 PM UTC)
     current_utc_time = datetime.datetime.utcnow()
     current_utc_date = current_utc_time.date()
 
     # ==========================================
-    # STEP 1: The Macro Regime Filter & Ping Trade
+    # STEP 1: Macro Filter & Defensive Hedge
     # ==========================================
     is_bullish = get_real_world_regime()
     
     if not is_bullish:
-        print("Macro Regime is BEARISH. Checking for needed liquidations...")
+        print(f"[{current_utc_time}] Macro: BEARISH (24h MA). Protecting capital.")
         traded_today = False
         
+        # Liquidate everything except safe-haven PAXG
         for coin in list(STATE["held_coins"].keys()):
-            pair = f"{coin}/USD"
-            held_amount = balance_data["SpotWallet"][coin]["Free"]
-            if held_amount > 0.001:
-                client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-                traded_today = True
-                
-        STATE["held_coins"].clear()
+            if coin != "PAXG":
+                pair = f"{coin}/USD"
+                held_amount = balance_data["SpotWallet"][coin]["Free"]
+                if held_amount > 0.001:
+                    print(f"Liquidating {coin} to USD...")
+                    client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                    traded_today = True
+                del STATE["held_coins"][coin]
         
-        if traded_today:
-            STATE["last_trade_date"] = current_utc_date
-            
-        # The Ping Trade: Triggers only if no trades happened today, 
-        # and only between 11:00 AM and 11:59 AM UTC (7:00 PM - 7:59 PM HKT)
+        # ACTIVITY RULE: Buy PAXG if no trades yet.
+        # Window set to 11 (7PM SGT) or 14 (10PM SGT) to fix today's miss.
         if STATE["last_trade_date"] != current_utc_date:
-            if current_utc_time.hour == 11: 
-                print("Approaching daily cutoff. Executing minimal ping trade...")
-                client.place_order(pair="ZEN/USD", side="BUY", order_type="MARKET", quantity=10.0)
-                client.place_order(pair="ZEN/USD", side="SELL", order_type="MARKET", quantity=10.0)
+            if current_utc_time.hour in [11, 14, 15]: 
+                print("Daily activity trade triggered: Buying PAXG Hedge.")
+                usd_balance = balance_data["SpotWallet"]["USD"]["Free"]
+                gold_price = market_data["PAXG/USD"]["LastPrice"]
+                buy_qty = (usd_balance * 0.05) / gold_price
+                
+                client.place_order(pair="PAXG/USD", side="BUY", order_type="MARKET", quantity=buy_qty)
+                STATE["held_coins"]["PAXG"] = gold_price
                 STATE["last_trade_date"] = current_utc_date
-                print("Ping trade complete. Daily activity logged.")
-            else:
-                print(f"Standing by safely in cash. Will check ping logic closer to cutoff.")
+                traded_today = True
+        
+        if traded_today: save_state(STATE)
         return
 
     # ==========================================
-    # STEP 2: Find the Top 5 Momentum Coins
+    # STEP 2: Momentum Logic (Bullish)
     # ==========================================
-    print("Macro Regime is BULLISH. Scanning for top 5 momentum assets...")
-    exclude_list = ["USDT/USD", "USDC/USD"]
+    print(f"[{current_utc_time}] Macro: BULLISH. Aggressive mode.")
     valid_pairs = []
-    
     for pair, info in market_data.items():
-        if pair not in exclude_list and info.get("Change", 0) > 0:
-            valid_pairs.append((pair, info.get("Change", 0)))
+        if "/USD" in pair and pair not in ["USDT/USD", "USDC/USD", "PAXG/USD"]:
+            if info.get("Change", 0) > 0:
+                valid_pairs.append((pair, info.get("Change", 0)))
             
     valid_pairs.sort(key=lambda x: x[1], reverse=True)
-    top_5_pairs = [x[0] for x in valid_pairs[:5]]
-    top_5_coins = [p.split('/')[0] for p in top_5_pairs]
+    top_5_coins = [x[0].split('/')[0] for x in valid_pairs[:5]]
 
-    if not top_5_pairs:
-        print("No positive momentum assets today. Staying in USD.")
-        return
-
-    # ==========================================
-    # STEP 3: Liquidate Losers (Anti-Churn)
-    # ==========================================
     traded_today = False
+    # Sell losers
     for coin in list(STATE["held_coins"].keys()):
         if coin not in top_5_coins:
             pair = f"{coin}/USD"
             held_amount = balance_data["SpotWallet"][coin]["Free"]
-            print(f"{coin} fell out of the Top 5. Liquidating...")
             if held_amount > 0.001:
                 client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                 traded_today = True
             del STATE["held_coins"][coin]
             
+    # Buy winners
     balance_data = client.get_balance()
     current_usd = balance_data["SpotWallet"]["USD"]["Free"]
-
-    # ==========================================
-    # STEP 4: Buy the New Winners
-    # ==========================================
-    coins_to_buy = [coin for coin in top_5_coins if coin not in STATE["held_coins"]]
+    coins_to_buy = [c for c in top_5_coins if c not in STATE["held_coins"]]
     
-    if not coins_to_buy:
-        print("Holding the optimal portfolio. No action needed.")
-        if traded_today: STATE["last_trade_date"] = current_utc_date
-        return
-        
-    usd_per_coin = (current_usd * 0.98) / len(coins_to_buy)
-    
-    for coin in coins_to_buy:
-        pair = f"{coin}/USD"
-        buy_price = market_data[pair]["LastPrice"]
-        quantity_to_buy = math.floor((usd_per_coin / buy_price) * 100) / 100.0
-        
-        print(f"Adding to portfolio: {coin} at {buy_price} per unit...")
-        order_response = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=quantity_to_buy)
-        
-        if order_response and order_response.get("Success"):
-            STATE["held_coins"][coin] = buy_price
+    if coins_to_buy:
+        usd_per_coin = (current_usd * 0.95) / len(coins_to_buy)
+        for coin in coins_to_buy:
+            pair = f"{coin}/USD"
+            price = market_data[pair]["LastPrice"]
+            qty = math.floor((usd_per_coin / price) * 100) / 100.0
+            client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
+            STATE["held_coins"][coin] = price
             traded_today = True
             
     if traded_today:
         STATE["last_trade_date"] = current_utc_date
+        save_state(STATE)
