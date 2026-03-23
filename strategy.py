@@ -40,17 +40,17 @@ def auto_heal_memory(balance_data, market_data):
     global STATE
     actual_balances = balance_data.get("SpotWallet", {})
     
-    # Remove ghost coins (in memory but 0 balance)
+    # Remove ghosts
     ghosts = [c for c in list(STATE["held_coins"].keys()) if actual_balances.get(c, {}).get("Free", 0) <= 0.001]
     for g in ghosts: del STATE["held_coins"][g]
         
-    # Add real unrecorded coins (like the massive WIF bag)
+    # Add real holdings found on exchange
     for coin, info in actual_balances.items():
         if coin != "USD" and info.get("Free", 0) > 0.001 and coin not in STATE["held_coins"]:
             pair = f"{coin}/USD"
             if pair in market_data:
                 STATE["held_coins"][coin] = market_data[pair]["LastPrice"]
-                print(f"Auto-Healed Memory: Found {info.get('Free')} of {coin}")
+                print(f"Auto-Healed: Synced {coin} bag to memory.")
 
 def check_stop_loss(client):
     global STATE
@@ -75,8 +75,8 @@ def check_stop_loss(client):
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0:
                 resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-                if resp and resp.get("Success") is True:
-                    print(f"STOP LOSS: {pair} liquidated successfully.")
+                if resp and resp.get("Success"):
+                    print(f"STOP LOSS: {pair} liquidated.")
                     coins_to_remove.append(coin)
                     triggered = True
             
@@ -91,12 +91,10 @@ def get_real_world_regime():
         url = "https://api.binance.com/api/v3/klines"
         params = {"symbol": "BTCUSDT", "interval": "4h", "limit": 6} 
         response = requests.get(url, params=params, timeout=5)
-        response.raise_for_status()
         data = response.json()
         closes = [float(candle[4]) for candle in data]
         return closes[-1] > (sum(closes) / len(closes))
-    except:
-        return False
+    except: return False
 
 def run_rebalance(client):
     global STATE
@@ -112,79 +110,84 @@ def run_rebalance(client):
     is_bullish = get_real_world_regime()
     
     if not is_bullish:
-        print(f"[{current_utc_time}] Macro: BEARISH. Protecting capital.")
+        print(f"[{current_utc_time}] Macro: BEARISH. Hedging.")
         traded_today = False
-        
         for coin in list(STATE["held_coins"].keys()):
             if coin != "PAXG":
                 pair = f"{coin}/USD"
                 held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
                 if held_amount > 0.001:
                     resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-                    if resp and resp.get("Success") is True:
-                        print(f"Liquidated {coin} to USD.")
+                    if resp and resp.get("Success"):
+                        print(f"Liquidated {coin}.")
                         traded_today = True
                         del STATE["held_coins"][coin]
         
         if STATE["last_trade_date"] != current_utc_date:
             if current_utc_time.hour in [11, 14, 15]: 
                 usd_balance = balance_data.get("SpotWallet", {}).get("USD", {}).get("Free", 0)
-                if "PAXG/USD" in market_data and usd_balance > 0:
-                    gold_price = market_data["PAXG/USD"]["LastPrice"]
-                    buy_qty = format_qty(usd_balance * 0.05, gold_price)
-                    resp = client.place_order(pair="PAXG/USD", side="BUY", order_type="MARKET", quantity=buy_qty)
-                    if resp and resp.get("Success") is True:
-                        print("Daily activity trade: Bought PAXG Hedge.")
-                        STATE["held_coins"]["PAXG"] = gold_price
+                if "PAXG/USD" in market_data and usd_balance > 10:
+                    price = market_data["PAXG/USD"]["LastPrice"]
+                    qty = format_qty(usd_balance * 0.05, price)
+                    resp = client.place_order(pair="PAXG/USD", side="BUY", order_type="MARKET", quantity=qty)
+                    if resp and resp.get("Success"):
+                        STATE["held_coins"]["PAXG"] = price
                         STATE["last_trade_date"] = current_utc_date
                         traded_today = True
         
         if traded_today: save_state(STATE)
         return
 
-    print(f"[{current_utc_time}] Macro: BULLISH. Aggressive mode.")
-    valid_pairs = []
+    # --- BULLISH MOMENTUM WITH BUFFER ---
+    print(f"[{current_utc_time}] Macro: BULLISH. Buffering Active.")
+    
+    # Sort all pairs by 24h Change
+    sorted_pairs = []
     for pair, info in market_data.items():
         if type(info) == dict and "/USD" in pair and pair not in ["USDT/USD", "USDC/USD", "PAXG/USD"]:
-            if info.get("Change", 0) > 0:
-                valid_pairs.append((pair, info.get("Change", 0)))
-            
-    valid_pairs.sort(key=lambda x: x[1], reverse=True)
-    top_5_coins = [x[0].split('/')[0] for x in valid_pairs[:5]]
+            sorted_pairs.append((pair, info.get("Change", 0)))
+    sorted_pairs.sort(key=lambda x: x[1], reverse=True)
+
+    # Define thresholds
+    top_5_names = [p.split('/')[0] for p, _ in sorted_pairs[:5]]
+    top_10_names = [p.split('/')[0] for p, _ in sorted_pairs[:10]]
 
     traded_today = False
     
-    # Sell losers
+    # SELL LOGIC: Only sell if it drops out of the TOP 10
     for coin in list(STATE["held_coins"].keys()):
-        if coin not in top_5_coins:
+        if coin not in top_10_names:
             pair = f"{coin}/USD"
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0.001:
                 resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-                if resp and resp.get("Success") is True:
-                    print(f"Liquidated {coin} (fell out of Top 5).")
+                if resp and resp.get("Success"):
+                    print(f"Buffer Exit: {coin} fell out of Top 10.")
                     traded_today = True
                     del STATE["held_coins"][coin]
             
-    # Buy winners
+    # BUY LOGIC: Only enter if it is in the TOP 5
     balance_data = client.get_balance()
     current_usd = balance_data.get("SpotWallet", {}).get("USD", {}).get("Free", 0)
-    coins_to_buy = [c for c in top_5_coins if c not in STATE["held_coins"]]
     
-    if coins_to_buy and current_usd > 10:
-        usd_per_coin = (current_usd * 0.95) / len(coins_to_buy)
-        for coin in coins_to_buy:
+    # We want a max of 5 coins. How many slots are open?
+    open_slots = 5 - len(STATE["held_coins"])
+    candidates = [c for c in top_5_names if c not in STATE["held_coins"]]
+    
+    if open_slots > 0 and candidates and current_usd > 10:
+        # Fill as many open slots as we have candidates for
+        to_buy = candidates[:open_slots]
+        usd_per_coin = (current_usd * 0.95) / len(to_buy)
+        
+        for coin in to_buy:
             pair = f"{coin}/USD"
-            if pair in market_data:
-                price = market_data[pair]["LastPrice"]
-                qty = format_qty(usd_per_coin, price)
-                resp = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
-                if resp and resp.get("Success") is True:
-                    print(f"Successfully purchased {coin}.")
-                    STATE["held_coins"][coin] = price
-                    traded_today = True
-                else:
-                    print(f"FAILED to buy {coin}. Reason: {resp.get('ErrMsg', 'Unknown')}")
+            price = market_data[pair]["LastPrice"]
+            qty = format_qty(usd_per_coin, price)
+            resp = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
+            if resp and resp.get("Success"):
+                print(f"Buffer Entry: Purchased {coin} (Top 5).")
+                STATE["held_coins"][coin] = price
+                traded_today = True
             
     if traded_today:
         STATE["last_trade_date"] = current_utc_date
