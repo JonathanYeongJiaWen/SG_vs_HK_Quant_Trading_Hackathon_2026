@@ -5,6 +5,7 @@ import json
 import os
 
 STATE_FILE = "state.json"
+STOP_LOSS_THRESHOLD = 0.03 
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -26,24 +27,6 @@ def save_state(state):
         json.dump(state_copy, f)
 
 STATE = load_state()
-STOP_LOSS_THRESHOLD = 0.03 
-
-# --- NEW 4H CALCULATION HELPER ---
-def get_4h_momentum(coin):
-    """Fetches real-world 4h performance from Binance."""
-    try:
-        # Most coins on Roostoo follow this naming on Binance
-        symbol = f"{coin}USDT"
-        if coin in ["PEPE", "SHIB", "BONK"]: symbol = f"1000{coin}USDT"
-        
-        url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": symbol, "interval": "1h", "limit": 5}
-        data = requests.get(url, params=params, timeout=2).json()
-        
-        price_4h_ago = float(data[0][4]) # Close of 4h ago candle
-        current_price = float(data[-1][4]) # Current price
-        return (current_price - price_4h_ago) / price_4h_ago
-    except: return -999 # Skip if not on Binance
 
 def format_qty(usd_amount, price):
     raw_qty = usd_amount / price
@@ -63,6 +46,20 @@ def auto_heal_memory(balance_data, market_data):
                 STATE["held_coins"][coin] = market_data[pair]["LastPrice"]
                 print(f"Auto-Healed: Synced {coin} bag to memory.")
 
+def get_4h_momentum(coin):
+    try:
+        symbol = f"{coin}USDT"
+        if coin in ["PEPE", "SHIB", "BONK", "CHEEMS"]: symbol = f"1000{coin}USDT"
+        
+        url = "https://api.binance.com/api/v3/klines"
+        params = {"symbol": symbol, "interval": "1h", "limit": 5}
+        data = requests.get(url, params=params, timeout=2).json()
+        
+        price_4h_ago = float(data[0][4]) 
+        current_price = float(data[-1][4]) 
+        return (current_price - price_4h_ago) / price_4h_ago
+    except: return -999 
+
 def get_real_world_regime():
     try:
         url = "https://api.binance.com/api/v3/klines"
@@ -72,6 +69,41 @@ def get_real_world_regime():
         closes = [float(candle[4]) for candle in data]
         return closes[-1] > (sum(closes) / len(closes))
     except: return False
+
+# --- MISSING FUNCTION RESTORED ---
+def check_stop_loss(client):
+    global STATE
+    if not STATE["held_coins"]: return False
+    ticker_data = client.get_ticker()
+    balance_data = client.get_balance()
+    if not ticker_data or not balance_data: return False
+    
+    market_data = ticker_data.get("Data", ticker_data)
+    auto_heal_memory(balance_data, market_data)
+    
+    coins_to_remove = []
+    triggered = False
+    
+    for coin, buy_price in STATE["held_coins"].items():
+        pair = f"{coin}/USD"
+        if pair not in market_data: continue
+        current_price = market_data[pair]["LastPrice"]
+        drop_percentage = (buy_price - current_price) / buy_price
+        
+        if drop_percentage >= STOP_LOSS_THRESHOLD:
+            held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
+            if held_amount > 0:
+                resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                if resp and resp.get("Success"):
+                    print(f"STOP LOSS: {pair} liquidated.")
+                    coins_to_remove.append(coin)
+                    triggered = True
+            
+    for coin in coins_to_remove:
+        del STATE["held_coins"][coin]
+    
+    if triggered: save_state(STATE)
+    return triggered
 
 def run_rebalance(client):
     global STATE
@@ -88,20 +120,41 @@ def run_rebalance(client):
     
     if not is_bullish:
         print(f"[{current_utc_time}] Macro: BEARISH. Hedging.")
-        # ... (Your existing liquidation logic)
+        traded_today = False
+        for coin in list(STATE["held_coins"].keys()):
+            if coin != "PAXG":
+                pair = f"{coin}/USD"
+                held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
+                if held_amount > 0.001:
+                    resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                    if resp and resp.get("Success"):
+                        print(f"Liquidated {coin}.")
+                        traded_today = True
+                        del STATE["held_coins"][coin]
+        
+        if STATE["last_trade_date"] != current_utc_date:
+            if current_utc_time.hour in [11, 14, 15]: 
+                usd_balance = balance_data.get("SpotWallet", {}).get("USD", {}).get("Free", 0)
+                if "PAXG/USD" in market_data and usd_balance > 10:
+                    price = market_data["PAXG/USD"]["LastPrice"]
+                    qty = format_qty(usd_balance * 0.05, price)
+                    resp = client.place_order(pair="PAXG/USD", side="BUY", order_type="MARKET", quantity=qty)
+                    if resp and resp.get("Success"):
+                        STATE["held_coins"]["PAXG"] = price
+                        STATE["last_trade_date"] = current_utc_date
+                        traded_today = True
+        
+        if traded_today: save_state(STATE)
         return
 
-    # --- UPDATED 4H MOMENTUM SCAN ---
     print(f"[{current_utc_time}] Macro: BULLISH. Ranking by 4H Momentum...")
     
-    # 1. Get top 15 candidates by 24h volume (to avoid scanning 60 useless coins)
     candidates = []
     for pair, info in market_data.items():
-        if "/USD" in pair and pair not in ["USDT/USD", "USDC/USD", "PAXG/USD"]:
+        if type(info) == dict and "/USD" in pair and pair not in ["USDT/USD", "USDC/USD", "PAXG/USD"]:
             candidates.append((pair.split('/')[0], info.get("Change", 0)))
     candidates.sort(key=lambda x: x[1], reverse=True)
     
-    # 2. Re-rank those Top 15 using actual 4H data
     momentum_list = []
     for coin, _ in candidates[:15]:
         m4 = get_4h_momentum(coin)
@@ -113,7 +166,6 @@ def run_rebalance(client):
     top_5_names = [x[0] for x in momentum_list[:5]]
     top_10_names = [x[0] for x in momentum_list[:10]]
 
-    # --- REST OF YOUR ORIGINAL BUFFER LOGIC ---
     traded_today = False
     for coin in list(STATE["held_coins"].keys()):
         if coin not in top_10_names:
