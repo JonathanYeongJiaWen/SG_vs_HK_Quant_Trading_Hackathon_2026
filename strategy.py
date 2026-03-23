@@ -29,6 +29,19 @@ def save_state(state):
 STATE = load_state()
 STOP_LOSS_THRESHOLD = 0.03 
 
+def format_qty(usd_amount, price):
+    """Smart rounding to bypass Roostoo step size errors."""
+    raw_qty = usd_amount / price
+    if price > 1000:
+        # High-value assets (BTC, ETH, PAXG) need decimals
+        return math.floor(raw_qty * 10000) / 10000.0
+    elif price > 10:
+        # Mid-value assets (SOL, AAVE) usually accept 2 decimals
+        return math.floor(raw_qty * 100) / 100.0
+    else:
+        # Cheap altcoins (WIF, APT, PEPE) require whole integers
+        return float(math.floor(raw_qty))
+    
 def check_stop_loss(client):
     global STATE
     if not STATE["held_coins"]: return False
