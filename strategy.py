@@ -148,10 +148,22 @@ def run_rebalance(client):
             pair = f"{coin}/USD"
             if pair in market_data:
                 price = market_data[pair]["LastPrice"]
-                qty = math.floor((usd_per_coin / price) * 100) / 100.0
-                client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
-                STATE["held_coins"][coin] = price
-                traded_today = True
+                
+                # Round quantity to handle precision errors on meme coins
+                qty = round((usd_per_coin / price), 4) 
+                
+                print(f"Attempting to buy {qty} of {coin}...")
+                order_response = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
+                
+                print(f"Roostoo API Response: {order_response}")
+                
+                # ONLY save to memory if the exchange confirms the trade
+                if order_response and order_response.get("Success") is True:
+                    STATE["held_coins"][coin] = price
+                    traded_today = True
+                    print(f"Successfully purchased {coin}.")
+                else:
+                    print(f"FAILED to buy {coin}. Reason: {order_response.get('ErrMsg', 'Unknown')}")
             
     if traded_today:
         STATE["last_trade_date"] = current_utc_date
