@@ -14,8 +14,7 @@ def load_state():
                 if state.get("last_trade_date"):
                     state["last_trade_date"] = datetime.datetime.strptime(state["last_trade_date"], "%Y-%m-%d").date()
                 return state
-        except:
-            pass
+        except: pass
     return {"held_coins": {}, "last_trade_date": None}
 
 def save_state(state):
@@ -32,16 +31,27 @@ STOP_LOSS_THRESHOLD = 0.03
 def format_qty(usd_amount, price):
     """Smart rounding to bypass Roostoo step size errors."""
     raw_qty = usd_amount / price
-    if price > 1000:
-        # High-value assets (BTC, ETH, PAXG) need decimals
-        return math.floor(raw_qty * 10000) / 10000.0
-    elif price > 10:
-        # Mid-value assets (SOL, AAVE) usually accept 2 decimals
-        return math.floor(raw_qty * 100) / 100.0
-    else:
-        # Cheap altcoins (WIF, APT, PEPE) require whole integers
-        return float(math.floor(raw_qty))
+    if price > 1000: return math.floor(raw_qty * 10000) / 10000.0
+    elif price > 10: return math.floor(raw_qty * 100) / 100.0
+    else: return float(math.floor(raw_qty))
+
+def auto_heal_memory(balance_data, market_data):
+    """Syncs the bot's memory with actual exchange balances."""
+    global STATE
+    actual_balances = balance_data.get("SpotWallet", {})
     
+    # Remove ghost coins (in memory but 0 balance)
+    ghosts = [c for c in list(STATE["held_coins"].keys()) if actual_balances.get(c, {}).get("Free", 0) <= 0.001]
+    for g in ghosts: del STATE["held_coins"][g]
+        
+    # Add real unrecorded coins (like the massive WIF bag)
+    for coin, info in actual_balances.items():
+        if coin != "USD" and info.get("Free", 0) > 0.001 and coin not in STATE["held_coins"]:
+            pair = f"{coin}/USD"
+            if pair in market_data:
+                STATE["held_coins"][coin] = market_data[pair]["LastPrice"]
+                print(f"Auto-Healed Memory: Found {info.get('Free')} of {coin}")
+
 def check_stop_loss(client):
     global STATE
     if not STATE["held_coins"]: return False
@@ -49,8 +59,9 @@ def check_stop_loss(client):
     balance_data = client.get_balance()
     if not ticker_data or not balance_data: return False
     
-    # API Crash Fix 1: Safe fallback
     market_data = ticker_data.get("Data", ticker_data)
+    auto_heal_memory(balance_data, market_data)
+    
     coins_to_remove = []
     triggered = False
     
@@ -61,13 +72,13 @@ def check_stop_loss(client):
         drop_percentage = (buy_price - current_price) / buy_price
         
         if drop_percentage >= STOP_LOSS_THRESHOLD:
-            # API Crash Fix 2: Safe dictionary navigation
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0:
-                print(f"STOP LOSS: {pair} liquidated.")
-                client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-            coins_to_remove.append(coin)
-            triggered = True
+                resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                if resp and resp.get("Success") is True:
+                    print(f"STOP LOSS: {pair} liquidated successfully.")
+                    coins_to_remove.append(coin)
+                    triggered = True
             
     for coin in coins_to_remove:
         del STATE["held_coins"][coin]
@@ -93,40 +104,40 @@ def run_rebalance(client):
     balance_data = client.get_balance()
     if not ticker_data or not balance_data: return
 
-    # API Crash Fix 1: Safe fallback
     market_data = ticker_data.get("Data", ticker_data)
+    auto_heal_memory(balance_data, market_data)
 
     current_utc_time = datetime.datetime.utcnow()
     current_utc_date = current_utc_time.date()
-
     is_bullish = get_real_world_regime()
     
     if not is_bullish:
-        print(f"[{current_utc_time}] Macro: BEARISH (24h MA). Protecting capital.")
+        print(f"[{current_utc_time}] Macro: BEARISH. Protecting capital.")
         traded_today = False
         
         for coin in list(STATE["held_coins"].keys()):
             if coin != "PAXG":
                 pair = f"{coin}/USD"
-                # API Crash Fix 2: Safe dictionary navigation
                 held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
                 if held_amount > 0.001:
-                    print(f"Liquidating {coin} to USD...")
-                    client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-                    traded_today = True
-                del STATE["held_coins"][coin]
+                    resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                    if resp and resp.get("Success") is True:
+                        print(f"Liquidated {coin} to USD.")
+                        traded_today = True
+                        del STATE["held_coins"][coin]
         
         if STATE["last_trade_date"] != current_utc_date:
             if current_utc_time.hour in [11, 14, 15]: 
-                print("Daily activity trade triggered: Buying PAXG Hedge.")
                 usd_balance = balance_data.get("SpotWallet", {}).get("USD", {}).get("Free", 0)
                 if "PAXG/USD" in market_data and usd_balance > 0:
                     gold_price = market_data["PAXG/USD"]["LastPrice"]
-                    buy_qty = (usd_balance * 0.05) / gold_price
-                    client.place_order(pair="PAXG/USD", side="BUY", order_type="MARKET", quantity=buy_qty)
-                    STATE["held_coins"]["PAXG"] = gold_price
-                    STATE["last_trade_date"] = current_utc_date
-                    traded_today = True
+                    buy_qty = format_qty(usd_balance * 0.05, gold_price)
+                    resp = client.place_order(pair="PAXG/USD", side="BUY", order_type="MARKET", quantity=buy_qty)
+                    if resp and resp.get("Success") is True:
+                        print("Daily activity trade: Bought PAXG Hedge.")
+                        STATE["held_coins"]["PAXG"] = gold_price
+                        STATE["last_trade_date"] = current_utc_date
+                        traded_today = True
         
         if traded_today: save_state(STATE)
         return
@@ -142,41 +153,38 @@ def run_rebalance(client):
     top_5_coins = [x[0].split('/')[0] for x in valid_pairs[:5]]
 
     traded_today = False
+    
+    # Sell losers
     for coin in list(STATE["held_coins"].keys()):
         if coin not in top_5_coins:
             pair = f"{coin}/USD"
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0.001:
-                client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-                traded_today = True
-            del STATE["held_coins"][coin]
+                resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                if resp and resp.get("Success") is True:
+                    print(f"Liquidated {coin} (fell out of Top 5).")
+                    traded_today = True
+                    del STATE["held_coins"][coin]
             
+    # Buy winners
     balance_data = client.get_balance()
     current_usd = balance_data.get("SpotWallet", {}).get("USD", {}).get("Free", 0)
     coins_to_buy = [c for c in top_5_coins if c not in STATE["held_coins"]]
     
-    if coins_to_buy and current_usd > 0:
+    if coins_to_buy and current_usd > 10:
         usd_per_coin = (current_usd * 0.95) / len(coins_to_buy)
         for coin in coins_to_buy:
             pair = f"{coin}/USD"
             if pair in market_data:
                 price = market_data[pair]["LastPrice"]
-                
-                # Round quantity to handle precision errors on meme coins
                 qty = format_qty(usd_per_coin, price)
-                
-                print(f"Attempting to buy {qty} of {coin}...")
-                order_response = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
-                
-                print(f"Roostoo API Response: {order_response}")
-                
-                # ONLY save to memory if the exchange confirms the trade
-                if order_response and order_response.get("Success") is True:
+                resp = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
+                if resp and resp.get("Success") is True:
+                    print(f"Successfully purchased {coin}.")
                     STATE["held_coins"][coin] = price
                     traded_today = True
-                    print(f"Successfully purchased {coin}.")
                 else:
-                    print(f"FAILED to buy {coin}. Reason: {order_response.get('ErrMsg', 'Unknown')}")
+                    print(f"FAILED to buy {coin}. Reason: {resp.get('ErrMsg', 'Unknown')}")
             
     if traded_today:
         STATE["last_trade_date"] = current_utc_date
