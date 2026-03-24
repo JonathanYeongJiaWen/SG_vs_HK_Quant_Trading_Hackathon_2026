@@ -18,30 +18,48 @@ def setup():
     return RoostooClient(api_key=api_key, secret_key=secret_key)
 
 def run_bot():
-    """The Relentless 5-Minute Execution Engine."""
+    """The Dual-Loop Execution Engine."""
     client = setup()
-    print("Bot initialized. Starting execution loops...")
+    print("Bot initialized. Restoring Dual-Loop Execution...")
+    
+    # Timing Constants (in seconds)
+    FAST_LOOP_INTERVAL = 300      # 5 minutes for Defense (Stop-Loss)
+    SLOW_LOOP_INTERVAL = 14400    # 4 hours for Offense (Momentum Rebalance)
+    
+    last_slow_loop_time = 0
     
     while True:
+        current_time = time.time()
         print(f"\n--- System Check: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
         
         try:
-            # 1. DEFENSE: Check Stop-Loss (strategy.py will automatically impose the 60-min penalty if triggered)
+            # ==========================================
+            # 1. DEFENSE: Check Stop-Loss (Every 5 mins)
+            # ==========================================
             check_stop_loss(client)
             
-            # 2. OFFENSE: Momentum Rebalance (strategy.py will ignore any coin currently in penalty)
-            run_rebalance(client)
+            # ==========================================
+            # 2. OFFENSE: Momentum Rebalance (Every 4 hours)
+            # ==========================================
+            time_since_last_slow = current_time - last_slow_loop_time
+            
+            if time_since_last_slow >= SLOW_LOOP_INTERVAL:
+                print("Initiating 4-Hour Macro Regime & Rebalance Sequence...")
+                run_rebalance(client)
+                last_slow_loop_time = current_time
+            else:
+                minutes_left = int((SLOW_LOOP_INTERVAL - time_since_last_slow) / 60)
+                print(f"Holding positions. Next momentum rebalance in {minutes_left} minutes.")
                     
         except Exception as e:
-            # The Ultimate Safety Net: Catches any weird math or network errors
             print(f"SYSTEM ERROR in main loop: {e}")
             print("Sleeping for 60 seconds before retrying...")
             time.sleep(60)
-            continue # Skip the normal sleep and retry immediately
+            continue 
 
-        # Sleep for exactly 5 minutes before waking up to do the next check
+        # Sleep for 5 minutes before waking up to do the next check
         print("Cycle complete. Sleeping for 5 minutes...")
-        time.sleep(300)
+        time.sleep(FAST_LOOP_INTERVAL)
 
 if __name__ == "__main__":
     run_bot()
