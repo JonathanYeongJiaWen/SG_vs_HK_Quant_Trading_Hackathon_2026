@@ -14,9 +14,11 @@ def load_state():
                 state = json.load(f)
                 if state.get("last_trade_date"):
                     state["last_trade_date"] = datetime.datetime.strptime(state["last_trade_date"], "%Y-%m-%d").date()
+                if "cooldowns" not in state:
+                    state["cooldowns"] = {}
                 return state
         except: pass
-    return {"held_coins": {}, "last_trade_date": None}
+    return {"held_coins": {}, "last_trade_date": None, "cooldowns": {}}
 
 def save_state(state):
     state_copy = state.copy()
@@ -70,7 +72,6 @@ def get_real_world_regime():
         return closes[-1] > (sum(closes) / len(closes))
     except: return False
 
-# --- MISSING FUNCTION RESTORED ---
 def check_stop_loss(client):
     global STATE
     if not STATE["held_coins"]: return False
@@ -95,8 +96,10 @@ def check_stop_loss(client):
             if held_amount > 0:
                 resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                 if resp and resp.get("Success"):
-                    print(f"STOP LOSS: {pair} liquidated.")
+                    print(f"STOP LOSS: {pair} liquidated. Imposing 60-minute ban on {coin}.")
                     coins_to_remove.append(coin)
+                    # Add to cooldowns: Current UTC Timestamp + 3600 seconds
+                    STATE["cooldowns"][coin] = datetime.datetime.utcnow().timestamp() + 3600
                     triggered = True
             
     for coin in coins_to_remove:
@@ -118,6 +121,14 @@ def run_rebalance(client):
     current_utc_date = current_utc_time.date()
     is_bullish = get_real_world_regime()
     
+    # --- COOLDOWN CLEANUP ---
+    current_ts = current_utc_time.timestamp()
+    expired_cooldowns = [c for c, exp in STATE.get("cooldowns", {}).items() if current_ts > exp]
+    for c in expired_cooldowns:
+        del STATE["cooldowns"][c]
+        print(f"Cooldown expired for {c}. Eligible for momentum re-entry.")
+        save_state(STATE)
+
     if not is_bullish:
         print(f"[{current_utc_time}] Macro: BEARISH. Hedging.")
         traded_today = False
@@ -160,7 +171,7 @@ def run_rebalance(client):
         m4 = get_4h_momentum(coin)
         if m4 != -999:
             momentum_list.append((coin, m4))
-            print(f"Checking {coin}: 4H = {m4:.2%}")
+            # print(f"Checking {coin}: 4H = {m4:.2%}") # Optional: Uncomment to see the scans
 
     momentum_list.sort(key=lambda x: x[1], reverse=True)
     top_5_names = [x[0] for x in momentum_list[:5]]
@@ -181,7 +192,9 @@ def run_rebalance(client):
     balance_data = client.get_balance()
     current_usd = balance_data.get("SpotWallet", {}).get("USD", {}).get("Free", 0)
     open_slots = 5 - len(STATE["held_coins"])
-    to_buy_candidates = [c for c in top_5_names if c not in STATE["held_coins"]]
+    
+    # --- FILTER OUT COOLDOWN COINS ---
+    to_buy_candidates = [c for c in top_5_names if c not in STATE["held_coins"] and c not in STATE.get("cooldowns", {})]
     
     if open_slots > 0 and to_buy_candidates and current_usd > 10:
         to_buy = to_buy_candidates[:open_slots]
