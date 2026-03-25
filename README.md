@@ -51,4 +51,4 @@ The bot features an `auto_heal_memory` function, constantly cross-referencing it
 
 ---
 
-Note: I changed to this startegy previously at 24 March 12pm where I was -5% down.
+Note: I changed to this strategy at 25 March 12pm where I was -5% down.
