@@ -5,7 +5,7 @@ import json
 import os
 
 STATE_FILE = "state.json"
-STOP_LOSS_THRESHOLD = 0.06 # Loosened to 6% to prevent whipsawing
+STOP_LOSS_THRESHOLD = 0.06 
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -49,13 +49,11 @@ def auto_heal_memory(balance_data, market_data):
                 print(f"Auto-Healed: Synced {coin} bag to memory.")
 
 def get_24h_momentum(coin):
-    """Fetches real-world 24h performance from Binance."""
     try:
         symbol = f"{coin}USDT"
         if coin in ["PEPE", "SHIB", "BONK", "CHEEMS"]: symbol = f"1000{coin}USDT"
         
         url = "https://api.binance.com/api/v3/klines"
-        # 6 candles of 4 hours = 24 hours of data
         params = {"symbol": symbol, "interval": "4h", "limit": 6}
         data = requests.get(url, params=params, timeout=2).json()
         
@@ -100,7 +98,6 @@ def check_stop_loss(client):
                 if resp and resp.get("Success"):
                     print(f"STOP LOSS: {pair} liquidated. Imposing 60-minute ban on {coin}.")
                     coins_to_remove.append(coin)
-                    # Add to cooldowns: Current UTC Timestamp + 3600 seconds
                     STATE["cooldowns"][coin] = datetime.datetime.utcnow().timestamp() + 3600
                     triggered = True
             
@@ -160,16 +157,22 @@ def run_rebalance(client):
         if traded_today: save_state(STATE)
         return
 
-    print(f"[{current_utc_time}] Macro: BULLISH. Ranking by 24H Momentum...")
+    print(f"[{current_utc_time}] Macro: BULLISH. Ranking Blue-Chips by 24H Momentum...")
+    
+    # --- THE BLUE-CHIP WHITELIST ---
+    WHITELIST = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "LINK", "DOGE", "DOT"]
     
     candidates = []
     for pair, info in market_data.items():
-        if type(info) == dict and "/USD" in pair and pair not in ["USDT/USD", "USDC/USD", "PAXG/USD"]:
-            candidates.append((pair.split('/')[0], info.get("Change", 0)))
+        if type(info) == dict and "/USD" in pair:
+            coin_name = pair.split('/')[0]
+            if coin_name in WHITELIST:
+                candidates.append((coin_name, info.get("Change", 0)))
+    
     candidates.sort(key=lambda x: x[1], reverse=True)
     
     momentum_list = []
-    for coin, _ in candidates[:15]:
+    for coin, _ in candidates:
         m24 = get_24h_momentum(coin)
         if m24 != -999:
             momentum_list.append((coin, m24))
@@ -180,13 +183,14 @@ def run_rebalance(client):
 
     traded_today = False
     for coin in list(STATE["held_coins"].keys()):
+        # If a coin we currently hold isn't in the top 10 blue-chips, we sell it
         if coin not in top_10_names:
             pair = f"{coin}/USD"
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0.001:
                 resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                 if resp and resp.get("Success"):
-                    print(f"24H Exit: {coin} faded.")
+                    print(f"Exit: {coin} faded or removed from whitelist.")
                     traded_today = True
                     del STATE["held_coins"][coin]
             
@@ -206,7 +210,7 @@ def run_rebalance(client):
             qty = format_qty(usd_per_coin, price)
             resp = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
             if resp and resp.get("Success"):
-                print(f"24H Entry: Purchased {coin}.")
+                print(f"Entry: Purchased {coin} (Blue-Chip).")
                 STATE["held_coins"][coin] = price
                 traded_today = True
             
