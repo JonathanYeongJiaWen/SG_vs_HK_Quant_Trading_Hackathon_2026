@@ -159,8 +159,8 @@ def run_rebalance(client):
 
     print(f"[{current_utc_time}] Macro: BULLISH. Ranking Blue-Chips by 24H Momentum...")
     
-    # --- THE BLUE-CHIP WHITELIST ---
-    WHITELIST = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "LINK", "DOGE", "DOT"]
+    # --- THE 8-COIN BLUE-CHIP WHITELIST ---
+    WHITELIST = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "LINK"]
     
     candidates = []
     for pair, info in market_data.items():
@@ -178,19 +178,23 @@ def run_rebalance(client):
             momentum_list.append((coin, m24))
 
     momentum_list.sort(key=lambda x: x[1], reverse=True)
+    
+    # 1. The Buy Zone (Top 5)
     top_5_names = [x[0] for x in momentum_list[:5]]
-    top_10_names = [x[0] for x in momentum_list[:10]]
+    
+    # 2. The Safe Zone (Top 7) - The 8th coin is left out to be sold
+    safe_zone_names = [x[0] for x in momentum_list[:7]]
 
     traded_today = False
     for coin in list(STATE["held_coins"].keys()):
-        # If a coin we currently hold isn't in the top 10 blue-chips, we sell it
-        if coin not in top_10_names:
+        # 3. If the coin is NOT in the top 7, it is the lowest momentum coin. Sell it.
+        if coin not in safe_zone_names:
             pair = f"{coin}/USD"
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0.001:
                 resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                 if resp and resp.get("Success"):
-                    print(f"Exit: {coin} faded or removed from whitelist.")
+                    print(f"24H Exit: {coin} hit the lowest momentum rank. Liquidating.")
                     traded_today = True
                     del STATE["held_coins"][coin]
             
