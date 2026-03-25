@@ -5,7 +5,7 @@ import json
 import os
 
 STATE_FILE = "state.json"
-STOP_LOSS_THRESHOLD = 0.03 
+STOP_LOSS_THRESHOLD = 0.06 # Loosened to 6% to prevent whipsawing
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -48,18 +48,20 @@ def auto_heal_memory(balance_data, market_data):
                 STATE["held_coins"][coin] = market_data[pair]["LastPrice"]
                 print(f"Auto-Healed: Synced {coin} bag to memory.")
 
-def get_4h_momentum(coin):
+def get_24h_momentum(coin):
+    """Fetches real-world 24h performance from Binance."""
     try:
         symbol = f"{coin}USDT"
         if coin in ["PEPE", "SHIB", "BONK", "CHEEMS"]: symbol = f"1000{coin}USDT"
         
         url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": symbol, "interval": "1h", "limit": 5}
+        # 6 candles of 4 hours = 24 hours of data
+        params = {"symbol": symbol, "interval": "4h", "limit": 6}
         data = requests.get(url, params=params, timeout=2).json()
         
-        price_4h_ago = float(data[0][4]) 
+        price_24h_ago = float(data[0][4]) 
         current_price = float(data[-1][4]) 
-        return (current_price - price_4h_ago) / price_4h_ago
+        return (current_price - price_24h_ago) / price_24h_ago
     except: return -999 
 
 def get_real_world_regime():
@@ -158,7 +160,7 @@ def run_rebalance(client):
         if traded_today: save_state(STATE)
         return
 
-    print(f"[{current_utc_time}] Macro: BULLISH. Ranking by 4H Momentum...")
+    print(f"[{current_utc_time}] Macro: BULLISH. Ranking by 24H Momentum...")
     
     candidates = []
     for pair, info in market_data.items():
@@ -168,10 +170,9 @@ def run_rebalance(client):
     
     momentum_list = []
     for coin, _ in candidates[:15]:
-        m4 = get_4h_momentum(coin)
-        if m4 != -999:
-            momentum_list.append((coin, m4))
-            # print(f"Checking {coin}: 4H = {m4:.2%}") # Optional: Uncomment to see the scans
+        m24 = get_24h_momentum(coin)
+        if m24 != -999:
+            momentum_list.append((coin, m24))
 
     momentum_list.sort(key=lambda x: x[1], reverse=True)
     top_5_names = [x[0] for x in momentum_list[:5]]
@@ -185,7 +186,7 @@ def run_rebalance(client):
             if held_amount > 0.001:
                 resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                 if resp and resp.get("Success"):
-                    print(f"4H Exit: {coin} faded.")
+                    print(f"24H Exit: {coin} faded.")
                     traded_today = True
                     del STATE["held_coins"][coin]
             
@@ -205,7 +206,7 @@ def run_rebalance(client):
             qty = format_qty(usd_per_coin, price)
             resp = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
             if resp and resp.get("Success"):
-                print(f"4H Entry: Purchased {coin}.")
+                print(f"24H Entry: Purchased {coin}.")
                 STATE["held_coins"][coin] = price
                 traded_today = True
             
