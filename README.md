@@ -12,7 +12,7 @@ An automated, data-driven algorithmic trading system optimized for high-volatili
 * **Strategic Pivot:** The engine was upgraded from a standard absolute momentum tracker to a **Risk-Adjusted Momentum Strategy**.
 * **Reasoning:** The previous iteration suffered from "cash drag" during optimal purchasing windows and was susceptible to whipsawing during sideways market chop.
 * **Implementation:** We integrated a Golden Cross moving average crossover for systemic risk detection, True Proportional Allocation for capital efficiency, and a High-Water Mark memory system to actively protect floating profits.
-
+* **Note**: I changed to this strategy at 25 March 12pm where I was -5% down.
 ---
 
 ### 🚀 Strategy Architecture & Logic
@@ -51,4 +51,4 @@ The bot features an `auto_heal_memory` function, constantly cross-referencing it
 
 ---
 
-Note: I changed to this strategy at 25 March 12pm where I was -5% down.
+
