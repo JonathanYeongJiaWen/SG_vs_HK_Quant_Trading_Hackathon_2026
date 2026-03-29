@@ -5,7 +5,7 @@ import json
 import os
 
 STATE_FILE = "state.json"
-STOP_LOSS_THRESHOLD = 0.15 # Widened threshold for maximum volatility tolerance
+STOP_LOSS_THRESHOLD = 0.15 
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -50,7 +50,6 @@ def auto_heal_memory(balance_data, market_data):
                 print(f"Auto-Healed: Synced {coin} bag to memory.")
 
 def get_fast_momentum(coin):
-    """4-Hour sensitive momentum."""
     try:
         symbol = f"{coin}USDT"
         url = "https://api.binance.com/api/v3/klines"
@@ -64,11 +63,9 @@ def get_fast_momentum(coin):
         return -999 
 
 def get_real_world_regime():
-    """Macro shield disabled. Returns True to maintain full crypto exposure."""
     return True
 
 def check_stop_loss(client):
-    """Evaluates the 15% Trailing Stop-Loss against the High Water Mark."""
     global STATE
     if not STATE["held_coins"]: return False
     ticker_data = client.get_ticker()
@@ -104,9 +101,10 @@ def check_stop_loss(client):
         if drop_percentage >= STOP_LOSS_THRESHOLD:
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0:
-                resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
+                # Updated to LIMIT order
+                resp = client.place_order(pair=pair, side="SELL", order_type="LIMIT", quantity=held_amount, price=current_price)
                 if resp and resp.get("Success"):
-                    print(f"TRAILING STOP LOSS: {pair} liquidated at 15% drop. Imposing 60-minute ban on {coin}.")
+                    print(f"TRAILING STOP LOSS: {pair} limit sell placed at {current_price}. Imposing 60-minute ban on {coin}.")
                     coins_to_remove.append(coin)
                     STATE["cooldowns"][coin] = datetime.datetime.utcnow().timestamp() + 3600
                     triggered = True
@@ -128,9 +126,7 @@ def run_rebalance(client):
 
     current_utc_time = datetime.datetime.utcnow()
     current_utc_date = current_utc_time.date()
-    is_bullish = get_real_world_regime()
     
-    # --- COOLDOWN CLEANUP ---
     current_ts = current_utc_time.timestamp()
     expired_cooldowns = [c for c, exp in STATE.get("cooldowns", {}).items() if current_ts > exp]
     for c in expired_cooldowns:
@@ -138,17 +134,17 @@ def run_rebalance(client):
         print(f"Cooldown expired for {c}. Eligible for re-entry.")
         save_state(STATE)
 
-    # --- THE BULLISH OFFENSE ---
     print(f"[{current_utc_time}] Scanning ALL assets for extreme momentum...")
     
-    # Clean up any lingering PAXG from the previous strategy version
     if "PAXG" in STATE["held_coins"]:
         held_amount = balance_data.get("SpotWallet", {}).get("PAXG", {}).get("Free", 0)
         if held_amount > 0.001:
-            resp = client.place_order(pair="PAXG/USD", side="SELL", order_type="MARKET", quantity=held_amount)
-            if resp and resp.get("Success"):
-                print("Sold lingering PAXG hedge to re-deploy capital.")
-                del STATE["held_coins"]["PAXG"] 
+            paxg_price = market_data.get("PAXG/USD", {}).get("LastPrice", 0)
+            if paxg_price > 0:
+                resp = client.place_order(pair="PAXG/USD", side="SELL", order_type="LIMIT", quantity=held_amount, price=paxg_price)
+                if resp and resp.get("Success"):
+                    print("Placed limit order to sell lingering PAXG hedge.")
+                    del STATE["held_coins"]["PAXG"] 
         else:
             del STATE["held_coins"]["PAXG"] 
 
@@ -164,7 +160,6 @@ def run_rebalance(client):
         return
 
     candidates.sort(key=lambda x: x[1], reverse=True)
-    # Check the top 20 Roostoo volume/movers to avoid rate-limiting from scanning every Binance coin
     top_20_candidates = candidates[:20]
 
     momentum_list = []
@@ -189,11 +184,14 @@ def run_rebalance(client):
             pair = f"{coin}/USD"
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0.001:
-                resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-                if resp and resp.get("Success"):
-                    print(f"Exit: {coin} fell out of top momentum. Liquidating.")
-                    traded_today = True
-                    del STATE["held_coins"][coin]
+                current_price = market_data.get(pair, {}).get("LastPrice", 0)
+                if current_price > 0:
+                    # Updated to LIMIT order
+                    resp = client.place_order(pair=pair, side="SELL", order_type="LIMIT", quantity=held_amount, price=current_price)
+                    if resp and resp.get("Success"):
+                        print(f"Exit: {coin} fell out of top momentum. Limit sell placed at {current_price}.")
+                        traded_today = True
+                        del STATE["held_coins"][coin]
             
     balance_data = client.get_balance()
     current_usd = balance_data.get("SpotWallet", {}).get("USD", {}).get("Free", 0)
@@ -215,10 +213,11 @@ def run_rebalance(client):
             price = market_data[pair]["LastPrice"]
             qty = format_qty(usd_allocated, price)
             
-            resp = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
+            # Updated to LIMIT order
+            resp = client.place_order(pair=pair, side="BUY", order_type="LIMIT", quantity=qty, price=price)
             if resp and resp.get("Success"):
                 weight_percent = (coin_weight / total_weight) * 100
-                print(f"Entry: Purchased {coin} (Allocated {weight_percent:.1f}%).")
+                print(f"Entry: Limit buy placed for {coin} at {price} (Allocated {weight_percent:.1f}%).")
                 STATE["held_coins"][coin] = {"buy": price, "high": price}
                 traded_today = True
             
