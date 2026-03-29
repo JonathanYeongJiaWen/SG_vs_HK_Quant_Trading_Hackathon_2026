@@ -15,7 +15,6 @@ class RoostooClient:
         Generates HMAC SHA256 signature.
         Roostoo requires params to be sorted alphabetically and formatted as a query string.
         """
-        # THE FIX: Sorts parameters alphabetically and protects the forward slash
         query_string = urlencode(dict(sorted(params.items())), safe='/')
         signature = hmac.new(
             self.secret_key.encode('utf-8'),
@@ -87,3 +86,19 @@ class RoostooClient:
             params['price'] = str(price)
             
         return self._request('POST', '/v3/place_order', params=params, require_auth=True)
+
+    # --- NEW CLEANUP METHODS ---
+
+    def get_open_orders(self, pair: str = None):
+        """GET /v3/open_orders - RCL_TopLevelCheck level (Requires Auth)"""
+        params = {}
+        if pair:
+            params['pair'] = pair
+        return self._request('GET', '/v3/open_orders', params=params, require_auth=True)
+
+    def cancel_order(self, order_id: str, pair: str = None):
+        """POST /v3/cancel_order - RCL_TopLevelCheck level (Requires Auth)"""
+        params = {'order_id': str(order_id)}
+        if pair:
+            params['pair'] = pair
+        return self._request('POST', '/v3/cancel_order', params=params, require_auth=True)

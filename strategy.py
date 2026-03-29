@@ -37,17 +37,28 @@ def format_qty(usd_amount, price):
     else: return float(math.floor(raw_qty))
 
 def auto_heal_memory(balance_data, market_data):
+    """Updated to track both Free and Locked balances for Limit Orders."""
     global STATE
     actual_balances = balance_data.get("SpotWallet", {})
-    ghosts = [c for c in list(STATE["held_coins"].keys()) if actual_balances.get(c, {}).get("Free", 0) <= 0.001]
+    
+    ghosts = []
+    for c in list(STATE["held_coins"].keys()):
+        free_bal = actual_balances.get(c, {}).get("Free", 0)
+        locked_bal = actual_balances.get(c, {}).get("Locked", 0)
+        if (free_bal + locked_bal) <= 0.001:
+            ghosts.append(c)
+            
     for g in ghosts: del STATE["held_coins"][g]
+    
     for coin, info in actual_balances.items():
-        if coin != "USD" and info.get("Free", 0) > 0.001 and coin not in STATE["held_coins"]:
-            pair = f"{coin}/USD"
-            if pair in market_data:
-                price = market_data[pair]["LastPrice"]
-                STATE["held_coins"][coin] = {"buy": price, "high": price}
-                print(f"Auto-Healed: Synced {coin} bag to memory.")
+        if coin != "USD":
+            total_bal = info.get("Free", 0) + info.get("Locked", 0)
+            if total_bal > 0.001 and coin not in STATE["held_coins"]:
+                pair = f"{coin}/USD"
+                if pair in market_data:
+                    price = market_data[pair]["LastPrice"]
+                    STATE["held_coins"][coin] = {"buy": price, "high": price}
+                    print(f"Auto-Healed: Synced {coin} bag to memory (includes locked funds).")
 
 def get_fast_momentum(coin):
     try:
@@ -65,7 +76,29 @@ def get_fast_momentum(coin):
 def get_real_world_regime():
     return True
 
+def sweep_open_orders(client):
+    """Cancels all open limit orders so locked funds return to the Free balance."""
+    try:
+        open_orders_resp = client.get_open_orders()
+        if not open_orders_resp: return
+        
+        # Handle dict or list depending on Roostoo API response format
+        orders = open_orders_resp.get("Data", open_orders_resp) if isinstance(open_orders_resp, dict) else open_orders_resp
+        
+        if isinstance(orders, list) and len(orders) > 0:
+            print(f"Sweeping {len(orders)} hanging open order(s)...")
+            for order in orders:
+                # APIs usually return 'order_id' or 'id'
+                order_id = order.get("order_id") or order.get("id")
+                pair = order.get("pair")
+                if order_id:
+                    client.cancel_order(order_id=order_id, pair=pair)
+                    print(f"Cancelled hanging order {order_id} for {pair}.")
+    except Exception as e:
+        print(f"WARNING: Failed to sweep open orders. Error: {e}")
+        
 def check_stop_loss(client):
+    sweep_open_orders(client)
     global STATE
     if not STATE["held_coins"]: return False
     ticker_data = client.get_ticker()
@@ -99,9 +132,9 @@ def check_stop_loss(client):
         drop_percentage = (record["high"] - current_price) / record["high"]
         
         if drop_percentage >= STOP_LOSS_THRESHOLD:
+            # We only sell the "Free" balance. If it's already in a pending limit order, it will be in "Locked".
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0:
-                # Updated to LIMIT order
                 resp = client.place_order(pair=pair, side="SELL", order_type="LIMIT", quantity=held_amount, price=current_price)
                 if resp and resp.get("Success"):
                     print(f"TRAILING STOP LOSS: {pair} limit sell placed at {current_price}. Imposing 60-minute ban on {coin}.")
@@ -116,6 +149,7 @@ def check_stop_loss(client):
     return triggered
 
 def run_rebalance(client):
+    sweep_open_orders(client)
     global STATE
     ticker_data = client.get_ticker()
     balance_data = client.get_balance()
@@ -135,18 +169,6 @@ def run_rebalance(client):
         save_state(STATE)
 
     print(f"[{current_utc_time}] Scanning ALL assets for extreme momentum...")
-    
-    if "PAXG" in STATE["held_coins"]:
-        held_amount = balance_data.get("SpotWallet", {}).get("PAXG", {}).get("Free", 0)
-        if held_amount > 0.001:
-            paxg_price = market_data.get("PAXG/USD", {}).get("LastPrice", 0)
-            if paxg_price > 0:
-                resp = client.place_order(pair="PAXG/USD", side="SELL", order_type="LIMIT", quantity=held_amount, price=paxg_price)
-                if resp and resp.get("Success"):
-                    print("Placed limit order to sell lingering PAXG hedge.")
-                    del STATE["held_coins"]["PAXG"] 
-        else:
-            del STATE["held_coins"]["PAXG"] 
 
     candidates = []
     for pair, info in market_data.items():
@@ -168,10 +190,8 @@ def run_rebalance(client):
         if m_fast != -999:
             momentum_list.append((coin, m_fast))
 
-    if len(momentum_list) < len(top_20_candidates):
-        dropped_count = len(top_20_candidates) - len(momentum_list)
-        print(f"WARNING: Binance API dropped data for {dropped_count} coin(s). Aborting rebalance.")
-        return
+    # The strict Binance Mismatch abort check has been removed.
+    # The bot will proceed with whatever coins it successfully pulled.
 
     momentum_list.sort(key=lambda x: x[1], reverse=True)
     
@@ -186,7 +206,6 @@ def run_rebalance(client):
             if held_amount > 0.001:
                 current_price = market_data.get(pair, {}).get("LastPrice", 0)
                 if current_price > 0:
-                    # Updated to LIMIT order
                     resp = client.place_order(pair=pair, side="SELL", order_type="LIMIT", quantity=held_amount, price=current_price)
                     if resp and resp.get("Success"):
                         print(f"Exit: {coin} fell out of top momentum. Limit sell placed at {current_price}.")
@@ -213,7 +232,6 @@ def run_rebalance(client):
             price = market_data[pair]["LastPrice"]
             qty = format_qty(usd_allocated, price)
             
-            # Updated to LIMIT order
             resp = client.place_order(pair=pair, side="BUY", order_type="LIMIT", quantity=qty, price=price)
             if resp and resp.get("Success"):
                 weight_percent = (coin_weight / total_weight) * 100
