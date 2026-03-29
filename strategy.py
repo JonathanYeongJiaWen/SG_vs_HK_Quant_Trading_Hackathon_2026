@@ -36,8 +36,8 @@ def format_qty(usd_amount, price):
     elif price > 10: return math.floor(raw_qty * 100) / 100.0
     else: return float(math.floor(raw_qty))
 
-def auto_heal_memory(balance_data, market_data):
-    """Updated to track both Free and Locked balances for Limit Orders."""
+def auto_heal_memory(balance_data, market_data, client):
+    """Updated to reject and autonomously liquidate unsupported 'blind' coins like 1000CHEEMS."""
     global STATE
     actual_balances = balance_data.get("SpotWallet", {})
     
@@ -54,11 +54,22 @@ def auto_heal_memory(balance_data, market_data):
         if coin != "USD":
             total_bal = info.get("Free", 0) + info.get("Locked", 0)
             if total_bal > 0.001 and coin not in STATE["held_coins"]:
+                
+                # THE HACKATHON-COMPLIANT FIX: Automated liquidation
+                if get_fast_momentum(coin) == -999:
+                    print(f"WARNING: Discovered unsupported legacy asset {coin}. Initiating automated liquidation.")
+                    held_amount = info.get("Free", 0)
+                    if held_amount > 0.001:
+                        resp = client.place_order(pair=f"{coin}/USD", side="SELL", order_type="MARKET", quantity=held_amount)
+                        if resp and resp.get("Success"):
+                            print(f"Successfully auto-liquidated {coin} to free up capital.")
+                    continue 
+
                 pair = f"{coin}/USD"
                 if pair in market_data:
                     price = market_data[pair]["LastPrice"]
                     STATE["held_coins"][coin] = {"buy": price, "high": price}
-                    print(f"Auto-Healed: Synced {coin} bag to memory (includes locked funds).")
+                    print(f"Auto-Healed: Synced {coin} bag to memory.")
 
 def get_fast_momentum(coin):
     try:
@@ -76,27 +87,6 @@ def get_fast_momentum(coin):
 def get_real_world_regime():
     return True
 
-def sweep_open_orders(client):
-    """Cancels all open limit orders so locked funds return to the Free balance."""
-    try:
-        open_orders_resp = client.get_open_orders()
-        if not open_orders_resp: return
-        
-        # Handle dict or list depending on Roostoo API response format
-        orders = open_orders_resp.get("Data", open_orders_resp) if isinstance(open_orders_resp, dict) else open_orders_resp
-        
-        if isinstance(orders, list) and len(orders) > 0:
-            print(f"Sweeping {len(orders)} hanging open order(s)...")
-            for order in orders:
-                # APIs usually return 'order_id' or 'id'
-                order_id = order.get("order_id") or order.get("id")
-                pair = order.get("pair")
-                if order_id:
-                    client.cancel_order(order_id=order_id, pair=pair)
-                    print(f"Cancelled hanging order {order_id} for {pair}.")
-    except Exception as e:
-        print(f"WARNING: Failed to sweep open orders. Error: {e}")
-        
 def check_stop_loss(client):
     global STATE
     if not STATE["held_coins"]: return False
@@ -105,7 +95,7 @@ def check_stop_loss(client):
     if not ticker_data or not balance_data: return False
     
     market_data = ticker_data.get("Data", ticker_data)
-    auto_heal_memory(balance_data, market_data)
+    auto_heal_memory(balance_data, market_data, client)
     
     coins_to_remove = []
     triggered = False
@@ -131,12 +121,12 @@ def check_stop_loss(client):
         drop_percentage = (record["high"] - current_price) / record["high"]
         
         if drop_percentage >= STOP_LOSS_THRESHOLD:
-            # We only sell the "Free" balance. If it's already in a pending limit order, it will be in "Locked".
             held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
             if held_amount > 0:
-                resp = client.place_order(pair=pair, side="SELL", order_type="LIMIT", quantity=held_amount, price=current_price)
+                # Swapped to MARKET SELL to guarantee execution and prevent lockups
+                resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                 if resp and resp.get("Success"):
-                    print(f"TRAILING STOP LOSS: {pair} limit sell placed at {current_price}. Imposing 60-minute ban on {coin}.")
+                    print(f"TRAILING STOP LOSS: {pair} market sell executed. Imposing 60-minute ban on {coin}.")
                     coins_to_remove.append(coin)
                     STATE["cooldowns"][coin] = datetime.datetime.utcnow().timestamp() + 3600
                     triggered = True
@@ -154,7 +144,7 @@ def run_rebalance(client):
     if not ticker_data or not balance_data: return
 
     market_data = ticker_data.get("Data", ticker_data)
-    auto_heal_memory(balance_data, market_data)
+    auto_heal_memory(balance_data, market_data, client)
 
     current_utc_time = datetime.datetime.utcnow()
     current_utc_date = current_utc_time.date()
@@ -188,9 +178,6 @@ def run_rebalance(client):
         if m_fast != -999:
             momentum_list.append((coin, m_fast))
 
-    # The strict Binance Mismatch abort check has been removed.
-    # The bot will proceed with whatever coins it successfully pulled.
-
     momentum_list.sort(key=lambda x: x[1], reverse=True)
     
     top_5_names = [x[0] for x in momentum_list[:5]]
@@ -204,9 +191,10 @@ def run_rebalance(client):
             if held_amount > 0.001:
                 current_price = market_data.get(pair, {}).get("LastPrice", 0)
                 if current_price > 0:
-                    resp = client.place_order(pair=pair, side="SELL", order_type="LIMIT", quantity=held_amount, price=current_price)
+                    # Swapped to MARKET SELL to guarantee execution
+                    resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                     if resp and resp.get("Success"):
-                        print(f"Exit: {coin} fell out of top momentum. Limit sell placed at {current_price}.")
+                        print(f"Exit: {coin} fell out of top momentum. Market sell executed.")
                         traded_today = True
                         del STATE["held_coins"][coin]
             
@@ -219,7 +207,9 @@ def run_rebalance(client):
     if open_slots > 0 and to_buy_candidates and current_usd > 10:
         to_buy = to_buy_candidates[:open_slots]
         
+        # ALL-IN MATH FIX: Deploy 95% of available cash into the eligible targets, regardless of empty slots
         usd_to_spend = (current_usd * 0.95)
+        
         total_weight = sum([5 - top_5_names.index(c) for c in to_buy])
         
         for coin in to_buy:
@@ -230,6 +220,7 @@ def run_rebalance(client):
             price = market_data[pair]["LastPrice"]
             qty = format_qty(usd_allocated, price)
             
+            # Retained LIMIT BUY for better entry fees
             resp = client.place_order(pair=pair, side="BUY", order_type="LIMIT", quantity=qty, price=price)
             if resp and resp.get("Success"):
                 weight_percent = (coin_weight / total_weight) * 100
