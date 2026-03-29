@@ -98,7 +98,6 @@ def sweep_open_orders(client):
         print(f"WARNING: Failed to sweep open orders. Error: {e}")
         
 def check_stop_loss(client):
-    sweep_open_orders(client)
     global STATE
     if not STATE["held_coins"]: return False
     ticker_data = client.get_ticker()
@@ -149,7 +148,6 @@ def check_stop_loss(client):
     return triggered
 
 def run_rebalance(client):
-    sweep_open_orders(client)
     global STATE
     ticker_data = client.get_ticker()
     balance_data = client.get_balance()
