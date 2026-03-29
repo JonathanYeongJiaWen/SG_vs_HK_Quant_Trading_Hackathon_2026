@@ -24,7 +24,7 @@ def run_bot():
     
     # Timing Constants (in seconds)
     FAST_LOOP_INTERVAL = 300      # 5 minutes for Defense (Stop-Loss)
-    SLOW_LOOP_INTERVAL = 14400    # 4 hours for Offense (Momentum Rebalance)
+    SLOW_LOOP_INTERVAL = 3600     # 1 hour for Offense (Momentum Rebalance)
     
     last_slow_loop_time = 0
     
@@ -39,12 +39,12 @@ def run_bot():
             check_stop_loss(client)
             
             # ==========================================
-            # 2. OFFENSE: Momentum Rebalance (Every 4 hours)
+            # 2. OFFENSE: Momentum Rebalance (Every 1 hour)
             # ==========================================
             time_since_last_slow = current_time - last_slow_loop_time
             
             if time_since_last_slow >= SLOW_LOOP_INTERVAL:
-                print("Initiating 4-Hour Macro Regime & Rebalance Sequence...")
+                print("Initiating 1-Hour Momentum Rebalance Sequence...")
                 run_rebalance(client)
                 last_slow_loop_time = current_time
             else:

@@ -5,7 +5,7 @@ import json
 import os
 
 STATE_FILE = "state.json"
-STOP_LOSS_THRESHOLD = 0.06 
+STOP_LOSS_THRESHOLD = 0.15 # Widened threshold for maximum volatility tolerance
 
 def load_state():
     if os.path.exists(STATE_FILE):
@@ -46,39 +46,29 @@ def auto_heal_memory(balance_data, market_data):
             pair = f"{coin}/USD"
             if pair in market_data:
                 price = market_data[pair]["LastPrice"]
-                # Save as dict for Trailing Stop-Loss compatibility
                 STATE["held_coins"][coin] = {"buy": price, "high": price}
                 print(f"Auto-Healed: Synced {coin} bag to memory.")
 
-def get_24h_momentum(coin):
+def get_fast_momentum(coin):
+    """4-Hour sensitive momentum."""
     try:
         symbol = f"{coin}USDT"
         url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": symbol, "interval": "4h", "limit": 6}
+        params = {"symbol": symbol, "interval": "1h", "limit": 4} 
         data = requests.get(url, params=params, timeout=2).json()
         
-        price_24h_ago = float(data[0][4]) 
-        current_price = float(data[-1][4]) 
-        return (current_price - price_24h_ago) / price_24h_ago
-    except: return -999 
+        price_start = float(data[0][4]) 
+        price_end = float(data[-1][4]) 
+        return (price_end - price_start) / price_start
+    except: 
+        return -999 
 
 def get_real_world_regime():
-    """Golden Cross Macro Filter (20-hour vs 60-hour average)"""
-    try:
-        url = "https://api.binance.com/api/v3/klines"
-        params = {"symbol": "BTCUSDT", "interval": "4h", "limit": 20} 
-        response = requests.get(url, params=params, timeout=5)
-        data = response.json()
-        closes = [float(candle[4]) for candle in data]
-        
-        fast_ma = sum(closes[-5:]) / 5   # Last 20 hours
-        slow_ma = sum(closes[-15:]) / 15 # Last 60 hours
-        return fast_ma > slow_ma
-    except: 
-        return None # PATCH: Return None instead of False on API crash
+    """Macro shield disabled. Returns True to maintain full crypto exposure."""
+    return True
 
 def check_stop_loss(client):
-    """Evaluates the 6% Trailing Stop-Loss against the High Water Mark."""
+    """Evaluates the 15% Trailing Stop-Loss against the High Water Mark."""
     global STATE
     if not STATE["held_coins"]: return False
     ticker_data = client.get_ticker()
@@ -93,12 +83,11 @@ def check_stop_loss(client):
     state_updated = False
     
     for coin, record in list(STATE["held_coins"].items()):
-        if coin == "PAXG": continue # DO NOT apply trailing stop-loss to the Macro Hedge
+        if coin == "PAXG": continue 
         
         pair = f"{coin}/USD"
         if pair not in market_data: continue
         
-        # Backward compatibility: Convert old float formats to dict
         if isinstance(record, (float, int)):
             STATE["held_coins"][coin] = {"buy": float(record), "high": float(record)}
             record = STATE["held_coins"][coin]
@@ -106,7 +95,6 @@ def check_stop_loss(client):
 
         current_price = market_data[pair]["LastPrice"]
         
-        # Update High Water Mark if the price has gone up
         if current_price > record["high"]:
             STATE["held_coins"][coin]["high"] = current_price
             state_updated = True
@@ -118,7 +106,7 @@ def check_stop_loss(client):
             if held_amount > 0:
                 resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                 if resp and resp.get("Success"):
-                    print(f"TRAILING STOP LOSS: {pair} liquidated. Imposing 60-minute ban on {coin}.")
+                    print(f"TRAILING STOP LOSS: {pair} liquidated at 15% drop. Imposing 60-minute ban on {coin}.")
                     coins_to_remove.append(coin)
                     STATE["cooldowns"][coin] = datetime.datetime.utcnow().timestamp() + 3600
                     triggered = True
@@ -142,88 +130,52 @@ def run_rebalance(client):
     current_utc_date = current_utc_time.date()
     is_bullish = get_real_world_regime()
     
-    # PATCH: The Nuclear API Timeout Protector
-    if is_bullish is None:
-        print("WARNING: Binance API failed to return macro data. Aborting rebalance to prevent false liquidation.")
-        return
-    
     # --- COOLDOWN CLEANUP ---
     current_ts = current_utc_time.timestamp()
     expired_cooldowns = [c for c, exp in STATE.get("cooldowns", {}).items() if current_ts > exp]
     for c in expired_cooldowns:
         del STATE["cooldowns"][c]
-        print(f"Cooldown expired for {c}. Eligible for momentum re-entry.")
+        print(f"Cooldown expired for {c}. Eligible for re-entry.")
         save_state(STATE)
 
-    # --- THE BEARISH SHIELD ---
-    if not is_bullish:
-        print(f"[{current_utc_time}] Macro: BEARISH. Hedging.")
-        traded_today = False
-        for coin in list(STATE["held_coins"].keys()):
-            if coin != "PAXG":
-                pair = f"{coin}/USD"
-                held_amount = balance_data.get("SpotWallet", {}).get(coin, {}).get("Free", 0)
-                if held_amount > 0.001:
-                    resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
-                    if resp and resp.get("Success"):
-                        print(f"Liquidated {coin}.")
-                        traded_today = True
-                        del STATE["held_coins"][coin]
-        
-        # Unrestricted Hedge Entry (95% Capital Deployment)
-        usd_balance = balance_data.get("SpotWallet", {}).get("USD", {}).get("Free", 0)
-        if "PAXG/USD" in market_data and usd_balance > 10 and "PAXG" not in STATE["held_coins"]:
-            price = market_data["PAXG/USD"]["LastPrice"]
-            qty = format_qty(usd_balance * 0.95, price)
-            resp = client.place_order(pair="PAXG/USD", side="BUY", order_type="MARKET", quantity=qty)
-            if resp and resp.get("Success"):
-                print("Hedged into PAXG (Gold).")
-                STATE["held_coins"]["PAXG"] = {"buy": price, "high": price}
-                traded_today = True
-        
-        if traded_today: save_state(STATE)
-        return
-
     # --- THE BULLISH OFFENSE ---
-    print(f"[{current_utc_time}] Macro: BULLISH. Ranking Blue-Chips by 24H Momentum...")
+    print(f"[{current_utc_time}] Scanning ALL assets for extreme momentum...")
     
-    # LIQUIDATE HEDGE ON BULLISH FLIP
+    # Clean up any lingering PAXG from the previous strategy version
     if "PAXG" in STATE["held_coins"]:
         held_amount = balance_data.get("SpotWallet", {}).get("PAXG", {}).get("Free", 0)
         if held_amount > 0.001:
             resp = client.place_order(pair="PAXG/USD", side="SELL", order_type="MARKET", quantity=held_amount)
             if resp and resp.get("Success"):
-                print("Macro turned BULLISH. Sold PAXG hedge to re-deploy capital.")
-                del STATE["held_coins"]["PAXG"] # Safe deletion
+                print("Sold lingering PAXG hedge to re-deploy capital.")
+                del STATE["held_coins"]["PAXG"] 
         else:
-            del STATE["held_coins"]["PAXG"] # Clean up dust
+            del STATE["held_coins"]["PAXG"] 
 
-    WHITELIST = ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "LINK"]
-    
     candidates = []
     for pair, info in market_data.items():
         if type(info) == dict and "/USD" in pair:
             coin_name = pair.split('/')[0]
-            if coin_name in WHITELIST:
+            if coin_name not in ["USDT", "USDC", "PAXG"]:
                 candidates.append((coin_name, info.get("Change", 0)))
     
-    # Network Vulnerability Patch: Abort if API fails to return data
     if not candidates:
-        print("WARNING: API failed to return data. Aborting rebalance to prevent false liquidations.")
+        print("WARNING: API failed to return data. Aborting.")
         return
 
     candidates.sort(key=lambda x: x[1], reverse=True)
-    
-    momentum_list = []
-    for coin, _ in candidates:
-        m24 = get_24h_momentum(coin)
-        if m24 != -999:
-            momentum_list.append((coin, m24))
+    # Check the top 20 Roostoo volume/movers to avoid rate-limiting from scanning every Binance coin
+    top_20_candidates = candidates[:20]
 
-    # --- THE PHANTOM SELL PROTECTOR ---
-    if len(momentum_list) < len(candidates):
-        dropped_count = len(candidates) - len(momentum_list)
-        print(f"WARNING: Binance API dropped data for {dropped_count} coin(s). Aborting rebalance to prevent phantom liquidations.")
+    momentum_list = []
+    for coin, _ in top_20_candidates:
+        m_fast = get_fast_momentum(coin)
+        if m_fast != -999:
+            momentum_list.append((coin, m_fast))
+
+    if len(momentum_list) < len(top_20_candidates):
+        dropped_count = len(top_20_candidates) - len(momentum_list)
+        print(f"WARNING: Binance API dropped data for {dropped_count} coin(s). Aborting rebalance.")
         return
 
     momentum_list.sort(key=lambda x: x[1], reverse=True)
@@ -239,7 +191,7 @@ def run_rebalance(client):
             if held_amount > 0.001:
                 resp = client.place_order(pair=pair, side="SELL", order_type="MARKET", quantity=held_amount)
                 if resp and resp.get("Success"):
-                    print(f"24H Exit: {coin} hit the lowest momentum rank. Liquidating.")
+                    print(f"Exit: {coin} fell out of top momentum. Liquidating.")
                     traded_today = True
                     del STATE["held_coins"][coin]
             
@@ -252,16 +204,11 @@ def run_rebalance(client):
     if open_slots > 0 and to_buy_candidates and current_usd > 10:
         to_buy = to_buy_candidates[:open_slots]
         
-        # 1. Determine exactly how much of our total USD is allowed to be spent right now
         usd_to_spend = (current_usd * 0.95) * (len(to_buy) / open_slots)
-        
-        # 2. Sum the weights of ONLY the coins we are actually buying
         total_weight = sum([5 - top_5_names.index(c) for c in to_buy])
         
         for coin in to_buy:
             coin_weight = 5 - top_5_names.index(coin)
-            
-            # 3. True Proportional Allocation: Distribute the exact spendable cash by weight
             usd_allocated = usd_to_spend * (coin_weight / total_weight)
             
             pair = f"{coin}/USD"
@@ -271,7 +218,7 @@ def run_rebalance(client):
             resp = client.place_order(pair=pair, side="BUY", order_type="MARKET", quantity=qty)
             if resp and resp.get("Success"):
                 weight_percent = (coin_weight / total_weight) * 100
-                print(f"Entry: Purchased {coin} (Allocated {weight_percent:.1f}% of available spend).")
+                print(f"Entry: Purchased {coin} (Allocated {weight_percent:.1f}%).")
                 STATE["held_coins"][coin] = {"buy": price, "high": price}
                 traded_today = True
             
