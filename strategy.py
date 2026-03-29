@@ -219,7 +219,7 @@ def run_rebalance(client):
     if open_slots > 0 and to_buy_candidates and current_usd > 10:
         to_buy = to_buy_candidates[:open_slots]
         
-        usd_to_spend = (current_usd * 0.95) * (len(to_buy) / open_slots)
+        usd_to_spend = (current_usd * 0.95)
         total_weight = sum([5 - top_5_names.index(c) for c in to_buy])
         
         for coin in to_buy:
