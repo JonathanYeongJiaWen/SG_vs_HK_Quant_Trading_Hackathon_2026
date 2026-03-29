@@ -19,7 +19,16 @@ def load_state():
                 return state
         except: pass
     return {"held_coins": {}, "last_trade_date": None, "cooldowns": {}}
-
+def sweep_open_orders(client):
+    
+    print("Executing Pre-Flight Sweep: Nuking all ghost limit orders...")
+    try:
+        # Calling the protected _request method directly to pass zero parameters
+        resp = client._request('POST', '/v3/cancel_order', require_auth=True)
+        if resp and resp.get("Success"):
+            print("Sweep Complete: All trapped capital has been forcefully unlocked.")
+    except Exception as e:
+        print(f"WARNING: Sweep failed - {e}")
 def save_state(state):
     state_copy = state.copy()
     if state_copy.get("last_trade_date"):
@@ -138,6 +147,7 @@ def check_stop_loss(client):
     return triggered
 
 def run_rebalance(client):
+    sweep_open_orders(client)
     global STATE
     ticker_data = client.get_ticker()
     balance_data = client.get_balance()
